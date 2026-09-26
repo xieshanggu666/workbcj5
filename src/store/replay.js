@@ -41,7 +41,8 @@ const JOURNAL_SKIP = new Set([
   'startAssign', 'cancelAssign', 'focusOrder',
   'setClock', 'startAutoPlay', 'stopAutoPlay',
   'startMonitor', 'stopMonitor', 'focusAlert',
-  'assessActive', 'resetDispatchRoute', 'resetBatchRoute'
+  'assessActive', 'resetDispatchRoute', 'resetBatchRoute',
+  'switchDispatcher', 'syncPlanSweeper'
 ])
 
 const CATEGORY_META = {
@@ -64,7 +65,9 @@ const ACTION_CATEGORY = {
     holdDispatch: 'dispatch', resumeDispatch: 'dispatch',
     withdrawDispatch: 'dispatch', resetResource: 'dispatch',
     generatePlan: 'dispatch', updatePlanItem: 'dispatch', removePlanItem: 'dispatch',
-    clearPlan: 'dispatch', submitPlan: 'dispatch'
+    clearPlan: 'dispatch', submitPlan: 'dispatch',
+    joinPlan: 'dispatch', switchDispatcher: 'dispatch', recalcPlanConflicts: 'dispatch',
+    retryPlanItem: 'dispatch', cancelPlan: 'dispatch', expirePlanReservations: 'dispatch'
   },
   tr: {
     createBatch: 'transfer', reassignBatch: 'transfer', closeBatch: 'transfer', cancelBatch: 'transfer',
@@ -123,6 +126,9 @@ function takeSnapshot() {
       dispatches: cmd.dispatches,
       plan: cmd.plan,
       planResult: cmd.planResult,
+      planMeta: cmd.planMeta,
+      planReservations: cmd.planReservations,
+      submittedPlans: cmd.submittedPlans,
       selectedEventId: cmd.selectedEventId,
       filter: cmd.filter,
       search: cmd.search
@@ -234,11 +240,19 @@ function describeCmd(action, args, snap) {
       const ev = evInSnap(snap, args[0])
       return `重置事件资源、撤回全部派发：${ev?.title || args[0]}`
     }
-    case 'generatePlan': return '生成多灾点统筹分配方案'
-    case 'updatePlanItem': return '人工调整统筹方案（数量/基地）'
-    case 'removePlanItem': return '删除统筹方案项'
-    case 'clearPlan': return '清空统筹方案'
-    case 'submitPlan': return '提交统筹方案、批量锁定库存并派发'
+    case 'generatePlan': return '生成多灾点统筹分配方案（库存预占）'
+    case 'updatePlanItem': return '人工调整统筹方案（数量/基地，预占迁移）'
+    case 'removePlanItem': return '删除统筹方案项（归还预占）'
+    case 'clearPlan': return '清空统筹方案（归还全部预占）'
+    case 'submitPlan': return '提交统筹方案：原子批量派发、预占转出库'
+    case 'cancelPlan': {
+      const a = args[0]
+      return a ? '撤销已提交统筹方案（在途余量回库）' : '撤销统筹方案草稿（归还预占）'
+    }
+    case 'joinPlan': return '调度员加入协同编制'
+    case 'recalcPlanConflicts': return '统筹方案冲突重算（换基/拆单迁移预占）'
+    case 'retryPlanItem': return '超时预占项重新预占'
+    case 'expirePlanReservations': return '统筹方案库存预占超时自动释放'
     default: return ''
   }
 }
@@ -555,6 +569,39 @@ function diffSnapshots(prev, next) {
     })
   })
 
+  /* 协同统筹：方案版本 + 库存预占流水（旧快照无字段时按空态处理） */
+  const prevMeta = prev?.cmd?.planMeta || null
+  const nextMeta = next.cmd?.planMeta || null
+  if (nextMeta && (!prevMeta || prevMeta.version !== nextMeta.version)) {
+    statusChanges.push({ icon: '🧮', color: CATEGORY_META.dispatch.color,
+      text: `协同方案版本：${prevMeta ? 'v' + prevMeta.version : '无'} → v${nextMeta.version}` })
+  }
+  if (prevMeta && !nextMeta) {
+    statusChanges.push({ icon: '🧮', color: CATEGORY_META.dispatch.color, text: '协同方案草稿已清空（提交归档 / 撤销）' })
+  }
+  const RV_STATUS_LABEL = { held: '预占中', consumed: '已出库', released: '已释放', expired: '超时释放' }
+  ;(next.cmd?.planReservations || []).forEach((r) => {
+    const old = prev ? (prev.cmd?.planReservations || []).find((x) => x.id === r.id) : null
+    if (old && old.status !== r.status) {
+      const bname = baseInSnap(next, r.baseId)?.name || r.baseId
+      const icon = r.status === 'consumed' ? '📤' : r.status === 'expired' ? '⏰' : '↩️'
+      statusChanges.push({ icon, color: CATEGORY_META.dispatch.color,
+        text: `库存预占 ${RESOURCE_TYPES[r.type]?.label || r.type} ${r.qty}${RESOURCE_TYPES[r.type]?.unit || ''}（${bname}）：${RV_STATUS_LABEL[old.status] || old.status} → ${RV_STATUS_LABEL[r.status] || r.status}` })
+    }
+  })
+  // 已提交/已撤销方案归档
+  ;(next.cmd?.submittedPlans || []).forEach((p) => {
+    const old = prev ? (prev.cmd?.submittedPlans || []).find((x) => x.id === p.id) : null
+    if (!old) {
+      statusChanges.push({ icon: '📦', color: CATEGORY_META.dispatch.color,
+        text: `方案「v${p.version}」提交归档：原子生成 ${p.dispatchIds.length} 条派发` })
+    } else if (old.status !== p.status && p.status === 'cancelled') {
+      const n = p.cancel?.returnedQty || 0
+      statusChanges.push({ icon: '🚫', color: CATEGORY_META.dispatch.color,
+        text: `撤销统筹方案「v${p.version}」：撤回派发 ${p.cancel?.dispatchCount || 0} 条` + (n ? `，在途余量 ${n} 回库` : '，预占归还') })
+    }
+  })
+
   /* 安置点占用：在住人数（快照内按批次实时汇总） */
   next.tr.shelters.forEach((s) => {
     const countIn = (snap) => snap.tr.batches
@@ -665,7 +712,27 @@ function summarizeSnapshot(snap) {
     }
   })
 
-  return { events, stock, beds, dispatches, batches, blocks, orders, alerts, settleDay: snap.tr.settleDay }
+  // 协同统筹：草稿版本/条目数 + 已归档方案提交与撤销状态
+  const plan = snap.cmd.planMeta
+    ? {
+        version: snap.cmd.planMeta.version,
+        items: snap.cmd.plan.length,
+        heldReservations: (snap.cmd.planReservations || []).filter((r) => r.status === 'held')
+          .reduce((s, r) => s + r.qty, 0),
+        status: snap.cmd.planMeta.status
+      }
+    : null
+  const plans = {}
+  ;(snap.cmd.submittedPlans || []).forEach((p) => {
+    plans[p.id] = {
+      version: p.version,
+      status: p.status,
+      dispatches: p.dispatchIds.length,
+      returned: p.cancel?.returnedQty || 0
+    }
+  })
+
+  return { events, stock, beds, dispatches, batches, blocks, orders, alerts, plan, plans, settleDay: snap.tr.settleDay }
 }
 
 // 对照两个快照：按 id 对齐事件/派发/批次/阻断/工单，按基地×物资对齐库存，按安置点对齐床位
@@ -757,10 +824,23 @@ function compareSnapshots(baseSnap, targetSnap) {
     add('实时预警', meta.name, x, y, same, fmt)
   })
 
+  // 协同统筹草稿
+  if (a.plan || b.plan) {
+    const fmt = (p) => p ? `v${p.version}｜${p.items} 项·预占 ${p.heldReservations}` : '—（无草稿）'
+    const same = !!a.plan === !!b.plan && (!a.plan || (a.plan.version === b.plan.version && a.plan.items === b.plan.items && a.plan.heldReservations === b.plan.heldReservations))
+    if (!same) rows.push({ dim: '统筹方案', label: '当前协同草稿', a: fmt(a.plan), b: fmt(b.plan) })
+  }
+  Object.keys({ ...a.plans, ...b.plans }).forEach((id) => {
+    const x = a.plans[id], y = b.plans[id]
+    const fmt = (p) => p ? `v${p.version}｜${p.status === 'cancelled' ? '已撤销' : '已提交'}·派发 ${p.dispatches}` + (p.returned ? `·回库 ${p.returned}` : '') : '—（无方案）'
+    const same = !!x === !!y && (!x || (x.status === y.status && x.dispatches === y.dispatches && x.returned === y.returned))
+    if (!same) rows.push({ dim: '统筹方案', label: `方案 v${y?.version || x.version}`, a: fmt(x), b: fmt(y) })
+  })
+
   // 结算日
   add('补给结算', '当前结算日', '第' + a.settleDay + '日', '第' + b.settleDay + '日', a.settleDay === b.settleDay)
 
-  const dims = ['事件状态', '基地库存', '安置床位', '物资派发', '转移批次', '道路阻断', '抢修工单', '实时预警', '补给结算']
+  const dims = ['事件状态', '基地库存', '安置床位', '物资派发', '转移批次', '道路阻断', '抢修工单', '实时预警', '统筹方案', '补给结算']
   return {
     rows,
     groups: dims.map((dim) => ({ dim, rows: rows.filter((r) => r.dim === dim) })).filter((g) => g.rows.length),
@@ -1172,9 +1252,15 @@ export const useReplayStore = defineStore('replay', {
       cmd.dispatches = clone(snap.cmd.dispatches)
       cmd.plan = clone(snap.cmd.plan)
       cmd.planResult = clone(snap.cmd.planResult)
+      // 协同统筹方案（旧快照无字段时按空态还原，保持兼容）
+      cmd.planMeta = clone(snap.cmd.planMeta || null)
+      cmd.planReservations = clone(snap.cmd.planReservations || [])
+      cmd.submittedPlans = clone(snap.cmd.submittedPlans || [])
       cmd.selectedEventId = snap.cmd.selectedEventId
       cmd.filter = clone(snap.cmd.filter)
       cmd.search = snap.cmd.search
+      // 按还原后的草稿状态重建超时扫描器（分叉/切分支各自独立）
+      if (typeof cmd.syncPlanSweeper === 'function') cmd.syncPlanSweeper()
 
       tr.shelters = clone(snap.tr.shelters)
       tr.batches = clone(snap.tr.batches)
