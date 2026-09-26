@@ -412,12 +412,12 @@ export const useWarningStore = defineStore('warning', {
       a.suggestion.forEach((s) => {
         let need = s.qty
         const cands = cmd.bases
-          .filter((b) => (b.stock[s.type] || 0) > 0)
+          .filter((b) => (cmd.availableMap[b.id + '|' + s.type] ?? 0) > 0)
           .map((b) => ({ b, path: roughPath(b.lng, b.lat, ev.location.lng, ev.location.lat) }))
           .sort((x, y) => x.path.minutes - y.path.minutes)
         for (const c of cands) {
           if (need <= 0) break
-          const take = Math.min(need, c.b.stock[s.type])
+          const take = Math.min(need, cmd.availableMap[c.b.id + '|' + s.type] ?? 0)
           const rec = cmd._pushDispatch(c.b.id, ev.id, s.type, take, '预警联动')
           if (rec) { sent.push(rec); need -= take }
         }

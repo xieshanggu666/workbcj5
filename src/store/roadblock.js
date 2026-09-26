@@ -330,7 +330,7 @@ export const useRoadblockStore = defineStore('roadblock', {
           }
           // 改派基地：在途余量库存足够、新路线不穿越任何生效阻断（出发地在区内时靠换基地撤出）
           const alt = cmd.bases
-            .filter((b) => b.id !== d.baseId && (b.stock[d.type] || 0) >= moveQty)
+            .filter((b) => b.id !== d.baseId && (cmd.availableMap[b.id + '|' + d.type] ?? 0) >= moveQty)
             .filter((b) => firstBlocker([[b.lng, b.lat], st.z], polys) < 0)
             .map((b) => ({ b, m: pathMetrics([[b.lng, b.lat], st.z]) }))
             .sort((x, y) => x.m.minutes - y.m.minutes)[0]

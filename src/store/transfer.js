@@ -262,14 +262,14 @@ export const useTransferStore = defineStore('transfer', {
       headcount = Math.max(1, Math.round(headcount || 0))
       vehicleCount = Math.max(1, Math.round(vehicleCount || 0))
       if (!ev || !base || !shelter) return { ok: false, msg: '参数不完整，请检查事件、车辆来源与安置点' }
-      if ((base.stock.vehicle || 0) < vehicleCount) {
-        return { ok: false, msg: `${base.name} 车辆不足（余 ${base.stock.vehicle || 0} 辆）` }
+      if ((cmd.availableMap[vehicleBaseId + '|vehicle'] ?? (base.stock.vehicle || 0)) < vehicleCount) {
+        return { ok: false, msg: `${base.name} 车辆不足（可用 ${cmd.availableMap[vehicleBaseId + '|vehicle'] ?? (base.stock.vehicle || 0)} 辆）` }
       }
       const beds = this.bedMap[shelterId]
       if (beds.left < headcount) {
         return { ok: false, msg: `${shelter.name} 剩余床位 ${beds.left}，不足 ${headcount} 人，请减少人数或更换安置点` }
       }
-      base.stock.vehicle -= vehicleCount // 占用车辆
+      cmd.stockOutExternal(vehicleBaseId, 'vehicle', vehicleCount, 'vehicle', { eventId, detail: '转移建批占用车辆' })
       const batch = {
         id: 'tb-' + Date.now() + '-' + ++batchSeq,
         eventId,
@@ -320,10 +320,11 @@ export const useTransferStore = defineStore('transfer', {
         const oldBase = cmd.bases.find((x) => x.id === b.vehicleBaseId)
         const newBase = cmd.bases.find((x) => x.id === vehicleBaseId)
         if (!newBase) return { ok: false, msg: '车辆来源不存在' }
-        const avail = (newBase.stock.vehicle || 0) + (newBase.id === b.vehicleBaseId && !b.vehicleReleased ? b.vehicleCount : 0)
+        const availNew = cmd.availableMap[vehicleBaseId + '|vehicle'] ?? (newBase.stock.vehicle || 0)
+        const avail = availNew + (newBase.id === b.vehicleBaseId && !b.vehicleReleased ? b.vehicleCount : 0)
         if (avail < vehicleCount) return { ok: false, msg: `${newBase.name} 车辆不足（可调 ${avail} 辆）` }
-        if (oldBase && !b.vehicleReleased) oldBase.stock.vehicle += b.vehicleCount
-        newBase.stock.vehicle -= vehicleCount
+        if (oldBase && !b.vehicleReleased) cmd.stockInExternal(b.vehicleBaseId, 'vehicle', b.vehicleCount, 'vehicleBack', { eventId: b.eventId, detail: '批次车辆改派回收' })
+        cmd.stockOutExternal(vehicleBaseId, 'vehicle', vehicleCount, 'vehicle', { eventId: b.eventId, detail: '批次车辆改派占用' })
         b.vehicleReleased = false
         if (vehicleBaseId !== b.vehicleBaseId || vehicleCount !== b.vehicleCount) {
           changes.push(`车辆改派：${newBase.name} ${vehicleCount} 辆`)
@@ -351,8 +352,9 @@ export const useTransferStore = defineStore('transfer', {
     },
     _releaseVehicles(b) {
       if (b.vehicleReleased) return
-      const base = this._cmd().bases.find((x) => x.id === b.vehicleBaseId)
-      if (base) base.stock.vehicle += b.vehicleCount
+      const cmd = this._cmd()
+      const base = cmd.bases.find((x) => x.id === b.vehicleBaseId)
+      if (base) cmd.stockInExternal(b.vehicleBaseId, 'vehicle', b.vehicleCount, 'vehicleBack', { eventId: b.eventId, detail: '批次办结/取消车辆回收' })
       b.vehicleReleased = true
     },
     // 取消（仅未开始接运的批次）
@@ -548,8 +550,8 @@ export const useTransferStore = defineStore('transfer', {
       // 新分组车辆：从所选基地库存新占（原批次车辆维持原配置，必要时指挥员可再改派）
       const base = cmd.bases.find((x) => x.id === vehicleBaseId)
       if (!base) return { ok: false, msg: '请选择车辆来源' }
-      if ((base.stock.vehicle || 0) < vehicleCount) {
-        return { ok: false, msg: `${base.name} 车辆不足（余 ${base.stock.vehicle || 0} 辆）` }
+      if ((cmd.availableMap[vehicleBaseId + '|vehicle'] ?? (base.stock.vehicle || 0)) < vehicleCount) {
+        return { ok: false, msg: `${base.name} 车辆不足（可用 ${cmd.availableMap[vehicleBaseId + '|vehicle'] ?? (base.stock.vehicle || 0)} 辆）` }
       }
       const shelter = this.shelters.find((s) => s.id === shelterId)
       if (!shelter) return { ok: false, msg: '请选择安置点' }
@@ -583,7 +585,7 @@ export const useTransferStore = defineStore('transfer', {
         // 新分组走全新路线，重新接受阻断评估
         held: false, holdBy: null, via: [], detourBy: null, eta: null
       }
-      base.stock.vehicle -= vehicleCount
+      cmd.stockOutExternal(vehicleBaseId, 'vehicle', vehicleCount, 'vehicle', { eventId: src.eventId, detail: '拆分新分组占用车辆' })
       this.batches.unshift(nb)
 
       // 同步两批的办结条件：按各自登记进度重新推导状态
@@ -678,12 +680,12 @@ export const useTransferStore = defineStore('transfer', {
       gaps.forEach(([type, g]) => {
         let need = g
         const cands = cmd.bases
-          .filter((b) => (b.stock[type] || 0) > 0)
+          .filter((b) => (cmd.availableMap[b.id + '|' + type] ?? 0) > 0)
           .map((b) => ({ b, path: roughPath(b.lng, b.lat, item.shelter.lng, item.shelter.lat) }))
           .sort((x, y) => x.path.minutes - y.path.minutes)
         for (const c of cands) {
           if (need <= 0) break
-          const take = Math.min(need, c.b.stock[type])
+          const take = Math.min(need, cmd.availableMap[c.b.id + '|' + type] ?? 0)
           const rec = cmd.dispatchToShelter({
             baseId: c.b.id, shelterId, shelterName: item.shelter.name,
             lng: item.shelter.lng, lat: item.shelter.lat, type, qty: take

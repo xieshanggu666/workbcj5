@@ -100,7 +100,7 @@
             {{ d.doneReason === 'returned' ? '↩️ 已退库' : d.doneReason === 'short' ? '⚠ 含短缺办结' : '✅ 已签收' }}
           </span>
           <span v-else-if="d.via && d.via.length" class="di-detour">🔀 绕行</span>
-          <span v-if="d.source" class="di-src" :class="{ plan: d.source === '统筹', replenish: (d.source || '').includes('补派') }">{{ d.source }}</span>
+          <span v-if="d.source" class="di-src" :class="{ plan: (d.source || '').includes('统筹'), replenish: (d.source || '').includes('补派') }">{{ d.source }}</span>
           <span class="di-qty">
             <em>{{ partsOf(d).received }}/{{ d.qty }}{{ d.unit }}</em>
             <i v-if="partsOf(d).inTransit > 0" class="q-transit">在途 {{ partsOf(d).inTransit }}</i>

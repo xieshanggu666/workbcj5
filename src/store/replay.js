@@ -40,6 +40,8 @@ const JOURNAL_SKIP = new Set([
   'startDrawing', 'addDraftPoint', 'undoDraftPoint', 'cancelDrawing', 'finishDrawing', 'cancelReport', 'quickPolygon',
   'startAssign', 'cancelAssign', 'focusOrder',
   'setClock', 'startAutoPlay', 'stopAutoPlay',
+  'setPlanClock', 'setReservationTtl', 'switchDispatcher',
+  'sweepExpiredReservations',
   'startMonitor', 'stopMonitor', 'focusAlert',
   'assessActive', 'resetDispatchRoute', 'resetBatchRoute'
 ])
@@ -63,8 +65,10 @@ const ACTION_CATEGORY = {
     rerouteDispatch: 'dispatch', reassignDispatch: 'dispatch',
     holdDispatch: 'dispatch', resumeDispatch: 'dispatch',
     withdrawDispatch: 'dispatch', resetResource: 'dispatch',
-    generatePlan: 'dispatch', updatePlanItem: 'dispatch', removePlanItem: 'dispatch',
-    clearPlan: 'dispatch', submitPlan: 'dispatch'
+    generatePlan: 'dispatch', addPlanItem: 'dispatch',
+    updatePlanItem: 'dispatch', removePlanItem: 'dispatch',
+    clearPlan: 'dispatch', submitPlan: 'dispatch',
+    beginPlanSession: 'dispatch', reReserveItem: 'dispatch', undoPlan: 'dispatch'
   },
   tr: {
     createBatch: 'transfer', reassignBatch: 'transfer', closeBatch: 'transfer', cancelBatch: 'transfer',
@@ -123,6 +127,13 @@ function takeSnapshot() {
       dispatches: cmd.dispatches,
       plan: cmd.plan,
       planResult: cmd.planResult,
+      // 协同编制：会话/预占/版本/库存变动/操作留痕（分支内全量快照隔离）
+      planSession: cmd.planSession,
+      reservations: cmd.reservations,
+      stockMovements: cmd.stockMovements,
+      planAudit: cmd.planAudit,
+      planVersion: cmd.planVersion,
+      currentDispatcherId: cmd.currentDispatcherId,
       selectedEventId: cmd.selectedEventId,
       filter: cmd.filter,
       search: cmd.search
@@ -234,11 +245,15 @@ function describeCmd(action, args, snap) {
       const ev = evInSnap(snap, args[0])
       return `重置事件资源、撤回全部派发：${ev?.title || args[0]}`
     }
-    case 'generatePlan': return '生成多灾点统筹分配方案'
-    case 'updatePlanItem': return '人工调整统筹方案（数量/基地）'
-    case 'removePlanItem': return '删除统筹方案项'
-    case 'clearPlan': return '清空统筹方案'
-    case 'submitPlan': return '提交统筹方案、批量锁定库存并派发'
+    case 'generatePlan': return '生成多灾点协同统筹方案（逐项库存预占）'
+    case 'beginPlanSession': return '开启协同方案编制会话'
+    case 'addPlanItem': return '协同追加方案项并预占库存'
+    case 'updatePlanItem': return '协同调整方案项（数量/基地，预占联动）'
+    case 'removePlanItem': return '删除协同方案项（归还预占）'
+    case 'reReserveItem': return '方案项预占超时后重新预占'
+    case 'clearPlan': return '清空协同方案（全部预占归还）'
+    case 'submitPlan': return '协同方案原子提交：预占转锁定、冲突重算并批量派发'
+    case 'undoPlan': return '撤销协同方案（编辑态归还预占 / 已提交整批撤回回库）'
     default: return ''
   }
 }
@@ -555,6 +570,49 @@ function diffSnapshots(prev, next) {
     })
   })
 
+  /* 库存变动流水（协同方案预占不扣实物；提交锁定/撤回回库/抢修转移等实际出入库逐笔入账） */
+  const oldMoves = prev ? (prev.cmd.stockMovements || []) : []
+  const newMoves = (next.cmd.stockMovements || []).slice(oldMoves.length)
+  newMoves.forEach((mv) => {
+    const inOut = mv.delta < 0 ? '出库' : '入库'
+    stocks.push({
+      base: mv.baseName,
+      type: mv.typeLabel,
+      unit: mv.unit,
+      from: 0, to: 0, delta: mv.delta,
+      movement: { icon: mv.icon, label: mv.label, inOut, qty: Math.abs(mv.delta), detail: mv.detail || '' }
+    })
+  })
+
+  /* 协同方案：会话状态 / 方案版本 / 预占台账变化 */
+  const oldSession = prev ? (prev.cmd.planSession || null) : null
+  const newSession = next.cmd.planSession || null
+  const SESSION_STATUS_TEXT = { editing: '编制中', submitted: '已提交', revoked: '已撤销' }
+  if (!oldSession && newSession) {
+    statusChanges.push({ icon: '🗂️', color: CATEGORY_META.dispatch.color, text: `开启协同方案「${newSession.name}」（发起人 ${newSession.createdByName || ''}）` })
+  } else if (oldSession && newSession && oldSession.status !== newSession.status) {
+    statusChanges.push({ icon: '🔁', color: CATEGORY_META.dispatch.color,
+      text: `协同方案「${newSession.name}」状态：${SESSION_STATUS_TEXT[oldSession.status] || oldSession.status} → ${SESSION_STATUS_TEXT[newSession.status] || newSession.status}` })
+  }
+  const oldResv = prev ? (prev.cmd.reservations || []) : []
+  const newResv = next.cmd.reservations || []
+  const resvCount = (list, st) => list.filter((r) => r.status === st).length
+  const resvDelta = (st) => resvCount(newResv, st) - resvCount(oldResv, st)
+  const activeQty = (list) => list.filter((r) => r.status === 'active').reduce((s, r) => s + r.qty, 0)
+  const aqNew = activeQty(newResv)
+  const aqOld = activeQty(oldResv)
+  if (!prev ? aqNew > 0 : aqNew !== aqOld || resvDelta('active') !== 0 || resvDelta('committed') !== 0 || resvDelta('expired') !== 0 || resvDelta('released') !== 0) {
+    const bits = []
+    if (aqNew !== aqOld || !prev) bits.push(`生效预占 ${aqNew}`)
+    if (resvDelta('committed') > 0) bits.push(`提交锁定 ${resvDelta('committed')} 笔`)
+    if (resvDelta('expired') > 0) bits.push(`超时释放 ${resvDelta('expired')} 笔`)
+    if (resvDelta('released') > 0) bits.push(`撤销/删项释放 ${resvDelta('released')} 笔`)
+    if (bits.length) statusChanges.push({ icon: '🔒', color: CATEGORY_META.dispatch.color, text: `协同方案库存预占：${bits.join('，')}` })
+  }
+  if (prev && (prev.cmd.planVersion || 0) !== (next.cmd.planVersion || 0)) {
+    counters.planVersion = next.cmd.planVersion || 0
+  }
+
   /* 安置点占用：在住人数（快照内按批次实时汇总） */
   next.tr.shelters.forEach((s) => {
     const countIn = (snap) => snap.tr.batches
@@ -577,6 +635,8 @@ function diffSnapshots(prev, next) {
   counters.orders = next.ro.orders.length
   counters.alerts = (next.wn?.alerts || []).filter((a) => a.status === 'issued' || a.status === 'confirmed').length
   counters.settleDay = next.tr.settleDay
+  counters.planVersion = next.cmd.planVersion || 0
+  counters.activeReservations = (next.cmd.reservations || []).filter((r) => r.status === 'active').length
 
   return { statusChanges, routes, stocks, occupancy, counters }
 }
@@ -1172,6 +1232,13 @@ export const useReplayStore = defineStore('replay', {
       cmd.dispatches = clone(snap.cmd.dispatches)
       cmd.plan = clone(snap.cmd.plan)
       cmd.planResult = clone(snap.cmd.planResult)
+      // 协同编制快照还原（旧快照无相关字段时归一化为空态，兼容旧方案/旧分支）
+      cmd.planSession = clone(snap.cmd.planSession || null)
+      cmd.reservations = clone(snap.cmd.reservations || [])
+      cmd.stockMovements = clone(snap.cmd.stockMovements || [])
+      cmd.planAudit = clone(snap.cmd.planAudit || [])
+      cmd.planVersion = snap.cmd.planVersion || 0
+      cmd.currentDispatcherId = snap.cmd.currentDispatcherId || cmd.currentDispatcherId
       cmd.selectedEventId = snap.cmd.selectedEventId
       cmd.filter = clone(snap.cmd.filter)
       cmd.search = snap.cmd.search

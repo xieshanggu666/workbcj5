@@ -215,15 +215,26 @@
 
               <!-- 资源占用 -->
               <div class="detail-card">
-                <h4>🏗️ 资源占用（基地库存）</h4>
+                <h4>🏗️ 资源占用（基地库存 / 出入库流水）</h4>
                 <ul v-if="diff.stocks.length">
-                  <li v-for="(x, i) in diff.stocks" :key="'k'+i">
-                    <span>📦</span>{{ x.base }} · {{ x.type }}
-                    <em class="num" :class="x.delta < 0 ? 'down' : 'up'">
-                      {{ x.from }} → {{ x.to }}{{ x.unit }}
-                      （{{ x.delta > 0 ? '+' : '' }}{{ x.delta }}）
-                    </em>
-                  </li>
+                  <template v-for="(x, i) in diff.stocks" :key="'k'+i">
+                    <!-- 库存余额变动 -->
+                    <li v-if="!x.movement">
+                      <span>📦</span>{{ x.base }} · {{ x.type }}
+                      <em class="num" :class="x.delta < 0 ? 'down' : 'up'">
+                        {{ x.from }} → {{ x.to }}{{ x.unit }}
+                        （{{ x.delta > 0 ? '+' : '' }}{{ x.delta }}）
+                      </em>
+                    </li>
+                    <!-- 库存变动流水（派发/撤回/预占提交锁定/抢修转移等实际出入库） -->
+                    <li v-else class="mv-row">
+                      <span>{{ x.movement.icon }}</span>{{ x.base }} · {{ x.type }}
+                      <em class="num" :class="x.delta < 0 ? 'down' : 'up'">
+                        {{ x.movement.inOut }} {{ x.movement.qty }}{{ x.unit }}
+                      </em>
+                      <i class="mv-tag">{{ x.movement.label }}<template v-if="x.movement.detail"> · {{ x.movement.detail }}</template></i>
+                    </li>
+                  </template>
                 </ul>
                 <p v-else class="dim">本节点无库存变动</p>
 
@@ -693,6 +704,8 @@ function onOpenCompare() {
 .num { font-style: normal; margin-left: auto; font-variant-numeric: tabular-nums; }
 .num.down { color: #7ef0c9; }
 .num.up { color: #ff8a65; }
+.mv-row { flex-wrap: wrap; }
+.mv-tag { font-style: normal; font-size: 10px; color: #8ba2c8; margin-left: 18px; width: 100%; }
 
 .route-line { display: flex; gap: 6px; align-items: baseline; }
 .route-line strong { font-size: 12px; color: #dbe4f3; font-weight: 600; }

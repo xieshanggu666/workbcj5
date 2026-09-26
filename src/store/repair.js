@@ -82,23 +82,25 @@ export const useRepairStore = defineStore('repair', {
       if (personnel <= 0 && vehicles <= 0 && !mats.length) {
         return { ok: false, msg: '请至少分配抢修人员、车辆或物资' }
       }
-      // 库存校验（统一前置校验，避免部分扣减后回滚）
-      if ((base.stock.personnel || 0) < personnel) {
-        return { ok: false, msg: `${base.name} 救援人员不足（余 ${base.stock.personnel || 0} 人）` }
+      // 库存校验（统一前置校验，避免部分扣减后回滚；可用量须扣除协同方案生效预占）
+      const availOf = (type) => cmd.availableMap[baseId + '|' + type] ?? (base.stock[type] || 0)
+      if (availOf('personnel') < personnel) {
+        return { ok: false, msg: `${base.name} 救援人员不足（可用 ${availOf('personnel')} 人）` }
       }
-      if ((base.stock.vehicle || 0) < vehicles) {
-        return { ok: false, msg: `${base.name} 救援车辆不足（余 ${base.stock.vehicle || 0} 辆）` }
+      if (availOf('vehicle') < vehicles) {
+        return { ok: false, msg: `${base.name} 救援车辆不足（可用 ${availOf('vehicle')} 辆）` }
       }
       for (const m of mats) {
-        if ((base.stock[m.type] || 0) < m.qty) {
-          return { ok: false, msg: `${base.name} ${RESOURCE_TYPES[m.type].label}不足（余 ${base.stock[m.type] || 0} ${RESOURCE_TYPES[m.type].unit}）` }
+        if (availOf(m.type) < m.qty) {
+          return { ok: false, msg: `${base.name} ${RESOURCE_TYPES[m.type].label}不足（可用 ${availOf(m.type)} ${RESOURCE_TYPES[m.type].unit}）` }
         }
       }
 
-      // 扣减占用：人员/车辆/物资出库
-      base.stock.personnel = (base.stock.personnel || 0) - personnel
-      base.stock.vehicle = (base.stock.vehicle || 0) - vehicles
-      mats.forEach((m) => { base.stock[m.type] = (base.stock[m.type] || 0) - m.qty })
+      // 扣减占用：人员/车辆/物资出库（统一入库存变动流水，供分支回放）
+      const ref = { detail: `抢修派单：${blk.name}` }
+      if (personnel > 0) cmd.stockOutExternal(baseId, 'personnel', personnel, 'repair', ref)
+      if (vehicles > 0) cmd.stockOutExternal(baseId, 'vehicle', vehicles, 'repair', ref)
+      mats.forEach((m) => { if (m.qty > 0) cmd.stockOutExternal(baseId, m.type, m.qty, 'repair', ref) })
 
       const order = {
         id: 'ro-' + Date.now() + '-' + ++roSeq,
@@ -292,25 +294,29 @@ export const useRepairStore = defineStore('repair', {
       })
     },
 
-    // 结算（幂等）：派单量 − 实际消耗的剩余资源归还出库基地
+    // 结算（幂等）：派单量 − 实际消耗的剩余资源归还出库基地（入库存变动流水）
     _settle(o) {
       if (o.settled) return o.settlement
-      const base = this._cmd().bases.find((b) => b.id === o.baseId)
+      const cmd = this._cmd()
+      const base = cmd.bases.find((b) => b.id === o.baseId)
       const returned = { personnel: 0, vehicle: 0, materials: {} }
+      const back = (type, n) => {
+        if (n > 0 && base) cmd.stockInExternal(o.baseId, type, n, 'repairBack', { detail: `抢修结算归还：${o.blockName}` })
+      }
       if (o.personnel - o.personnelUsed > 0) {
         const n = o.personnel - o.personnelUsed
-        if (base) base.stock.personnel = (base.stock.personnel || 0) + n
+        back('personnel', n)
         returned.personnel = n
       }
       if (o.vehicles - o.vehiclesUsed > 0) {
         const n = o.vehicles - o.vehiclesUsed
-        if (base) base.stock.vehicle = (base.stock.vehicle || 0) + n
+        back('vehicle', n)
         returned.vehicle = n
       }
       o.materials.forEach((m) => {
         const n = m.qty - m.used
         if (n > 0) {
-          if (base) base.stock[m.type] = (base.stock[m.type] || 0) + n
+          back(m.type, n)
           returned.materials[m.type] = n
         }
       })

@@ -47,7 +47,41 @@ export function roughPath(lng1, lat1, lng2, lat2) {
 }
 
 let dpSeq = 0
+let mvSeq = 0
 const nowStr = () => new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+const nowMs = () => Date.now()
+
+/* ---------- 协同编制 ---------- */
+
+// 预置调度员（多名调度员共同编制同一统筹方案；演示用身份切换）
+export const DISPATCHERS = [
+  { id: 'u-zhao', name: '赵调度', role: '值班调度员' },
+  { id: 'u-qian', name: '钱调度', role: '物资调度员' },
+  { id: 'u-sun', name: '孙调度', role: '现场联络员' }
+]
+
+// 库存预占超时时长（ms）：超时未提交的预占自动释放、方案项标失效，需重新预占
+const RESERVATION_TTL = 5 * 60 * 1000
+// 库存变动流水上限（分支回放/帧差异展示用）
+const MOVEMENT_CAP = 400
+
+// 库存变动口径标签（资源占用维度回放）
+const MOVEMENT_META = {
+  dispatch: { icon: '📦', label: '派发扣减' },
+  replenish: { icon: '🔁', label: '短缺补派扣减' },
+  supply: { icon: '🥫', label: '安置补给扣减' },
+  sign: { icon: '📥', label: '签收入账' },
+  return: { icon: '↩️', label: '退回入库' },
+  hold: { icon: '⏸', label: '挂起回库' },
+  resume: { icon: '▶️', label: '续派扣减' },
+  reassignOut: { icon: '🔀', label: '改派旧库回补' },
+  reassignIn: { icon: '🔀', label: '改派新库扣减' },
+  withdraw: { icon: '🚫', label: '撤回回库' },
+  repair: { icon: '🔧', label: '抢修派工扣减' },
+  repairBack: { icon: '🔧', label: '抢修结算归还' },
+  vehicle: { icon: '🚌', label: '转移车辆占用' },
+  vehicleBack: { icon: '🚌', label: '车辆回收' }
+}
 
 export const useCommandStore = defineStore('command', {
   state: () => ({
@@ -59,6 +93,21 @@ export const useCommandStore = defineStore('command', {
     // 多灾点统筹：未提交的跨基地分配方案 / 最近一次批量派发结果
     plan: [],
     planResult: null,
+    // 统筹方案协同编制：当前调度员身份 / 方案版本（每次结构性改动自增）
+    currentDispatcherId: DISPATCHERS[0].id,
+    planVersion: 0,
+    // 方案协同会话：{ id, name, createdAt, createdBy, status, submittedAt, revokedAt, dispatchIds }
+    planSession: null,
+    // 库存预占台账：{ id, itemId, baseId, type, qty, owner, createdAt, expiresAt, status }
+    reservations: [],
+    // 库存变动流水（实际出入库，方案预占/释放不产生实际库存变化，单独记版本）
+    stockMovements: [],
+    // 协同会话流水（方案版本留痕：建会/编制/超时释放/提交/撤销）
+    planAudit: [],
+    // 协同方案预占 TTL（ms）；null=不超时。测试可固定/缩短
+    reservationTtl: RESERVATION_TTL,
+    // 演示/测试时钟（ms），null=真实时间
+    planClock: null,
     // 大屏统计
     selectedEventId: null,
     filter: { type: 'all', severity: 'all', status: 'all' },
@@ -136,6 +185,7 @@ export const useCommandStore = defineStore('command', {
       })
     },
     // 方案冲突检测：按 基地+类型 汇总预占，超出当前库存即冲突（提交时将触发重分配）
+    // 兼容旧方案项（无预占字段）：按当前方案项数量汇总
     planConflicts(state) {
       const use = {}
       state.plan.forEach((p) => {
@@ -150,6 +200,65 @@ export const useCommandStore = defineStore('command', {
         if (qty > stock) conflicts[k] = { planned: qty, stock }
       })
       return conflicts
+    },
+    // 当前调度员
+    currentDispatcher(state) {
+      return DISPATCHERS.find((u) => u.id === state.currentDispatcherId) || DISPATCHERS[0]
+    },
+    // 协同会话
+    activePlanSession(state) {
+      return state.planSession && state.planSession.status === 'editing' ? state.planSession : null
+    },
+    // 协同方案中的调度员（在线编制者）
+    planParticipants(state) {
+      const ids = new Set()
+      state.plan.forEach((p) => { if (p.owner) ids.add(p.owner) })
+      if (state.planSession?.createdBy) ids.add(state.planSession.createdBy)
+      return [...ids].map((id) => DISPATCHERS.find((u) => u.id === id) || { id, name: id, role: '' }).filter(Boolean)
+    },
+    // 方案项 id -> 生效预占（不含已释放/超时/已提交）
+    reservationByItem(state) {
+      const m = {}
+      state.reservations.filter((r) => r.status === 'active').forEach((r) => {
+        m[r.itemId] = r
+      })
+      return m
+    },
+    // 各 基地+类型 的生效预占总量（含本方案之外的预占；当前仅协同方案使用）
+    reservedMap(state) {
+      const m = {}
+      state.reservations.filter((r) => r.status === 'active').forEach((r) => {
+        const k = r.baseId + '|' + r.type
+        m[k] = (m[k] || 0) + r.qty
+      })
+      return m
+    },
+    // 各 基地+类型 可用量 = 实物库存 − 生效预占
+    availableMap() {
+      const m = {}
+      this.bases.forEach((b) => {
+        Object.keys(b.stock).forEach((t) => {
+          const k = b.id + '|' + t
+          m[k] = Math.max(0, (b.stock[t] || 0) - (this.reservedMap[k] || 0))
+        })
+      })
+      return m
+    },
+    // 方案项超时的 id 集合（预占已失效，需重新预占后才能提交）
+    expiredItemIds(state) {
+      const now = state.planClock != null ? state.planClock : nowMs()
+      const s = new Set()
+      state.reservations.forEach((r) => {
+        if (r.status === 'active' && state.reservationTtl != null && now - r.createdAt >= state.reservationTtl) s.add(r.itemId)
+      })
+      // 旧方案项（无预占）不判超时，提交时按旧口径即时校验
+      return s
+    },
+    // 超时但尚未落账释放的预占（供 UI 一键清理 / 提交前清理）
+    expiredReservations(state) {
+      const now = state.planClock != null ? state.planClock : nowMs()
+      if (state.reservationTtl == null) return []
+      return state.reservations.filter((r) => r.status === 'active' && now - r.createdAt >= state.reservationTtl)
     },
     // 大屏统计卡片
     stats(state) {
@@ -184,6 +293,13 @@ export const useCommandStore = defineStore('command', {
       this.dispatches = []
       this.plan = []
       this.planResult = null
+      this.planVersion = 0
+      this.planSession = null
+      this.reservations = []
+      this.stockMovements = []
+      this.planAudit = []
+      this.planClock = null
+      this.reservationTtl = RESERVATION_TTL
       this.selectedEventId = this.events[0] ? this.events[0].id : null
     },
     selectEvent(id) {
@@ -198,12 +314,100 @@ export const useCommandStore = defineStore('command', {
       ev.status = toStatus
       ev.timeline.push({ at: nowStr(), text: `状态变更：${from.label} → ${to.label}` })
     },
+
+    /* ---------- 库存变动流水（实际出入库统一入账，供分支回放/帧差异） ---------- */
+
+    _nowMs() { return this.planClock != null ? this.planClock : nowMs() },
+    // 供测试/演示固定时钟
+    setPlanClock(ms) { this.planClock = ms == null ? null : Number(ms) },
+    setReservationTtl(ms) { this.reservationTtl = ms == null ? null : Math.max(0, Number(ms)) },
+    // 内部：实物库存增减并落一笔变动流水（delta>0 入库，<0 出库；预占不经过此处）
+    _moveStock(baseId, type, delta, kind, ref = {}) {
+      if (!delta) return
+      const base = this.bases.find((b) => b.id === baseId)
+      if (!base) return
+      base.stock[type] = Math.max(0, (base.stock[type] || 0) + delta)
+      const meta = MOVEMENT_META[kind] || { icon: '🔁', label: kind }
+      this.stockMovements.push({
+        id: 'mv-' + ++mvSeq,
+        at: nowStr(), t: this._nowMs(),
+        baseId, baseName: base.name, type,
+        typeLabel: RESOURCE_TYPES[type]?.label || type,
+        unit: RESOURCE_TYPES[type]?.unit || '',
+        delta, kind, icon: meta.icon, label: meta.label,
+        eventId: ref.eventId || null, dispatchId: ref.dispatchId || null,
+        detail: ref.detail || ''
+      })
+      if (this.stockMovements.length > MOVEMENT_CAP) this.stockMovements.splice(0, this.stockMovements.length - MOVEMENT_CAP)
+    },
+    // 转移批次/抢修工单跨模块出库入口（车辆/人员/物资）
+    stockOutExternal(baseId, type, qty, kind, ref = {}) {
+      this._moveStock(baseId, type, -Math.abs(qty), kind, ref)
+    },
+    stockInExternal(baseId, type, qty, kind, ref = {}) {
+      this._moveStock(baseId, type, Math.abs(qty), kind, ref)
+    },
+
+    /* ---------- 库存预占（协同方案） ---------- */
+
+    // 内部：为方案项建立/追加预占（每个方案项至多一笔生效预占；qty 超过可用量时按可用量预占）
+    _reserveItem(item, qty, owner) {
+      const avail = this.availableMap[item.baseId + '|' + item.type] ?? 0
+      const add = Math.max(0, Math.min(qty, avail))
+      const t = this._nowMs()
+      let r = this.reservations.find((x) => x.itemId === item.id && x.status === 'active')
+      if (r) {
+        r.qty += add
+        r.expiresAt = this.reservationTtl != null ? t + this.reservationTtl : null
+        return r
+      }
+      // 可用量为 0：返回 qty=0 占位结果，不落台账（提交时冲突重算）
+      if (add <= 0) {
+        return {
+          id: null, itemId: item.id, baseId: item.baseId, type: item.type,
+          qty: 0, owner: owner || item.owner || this.currentDispatcherId,
+          createdAt: t, expiresAt: this.reservationTtl != null ? t + this.reservationTtl : null,
+          status: 'none'
+        }
+      }
+      r = {
+        id: 'rs-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7),
+        itemId: item.id, baseId: item.baseId, type: item.type,
+        qty: add, owner: owner || item.owner || this.currentDispatcherId,
+        createdAt: t, expiresAt: this.reservationTtl != null ? t + this.reservationTtl : null,
+        status: 'active'
+      }
+      this.reservations.push(r)
+      return r
+    },
+    // 内部：释放指定方案项的生效/超时预占（撤销/删除/提交锁定时调用）
+    _releaseItemReservation(itemId, reason = '') {
+      let n = 0
+      this.reservations.forEach((r) => {
+        if (r.itemId === itemId && (r.status === 'active' || r.status === 'expired')) {
+          if (r.status === 'active') n += r.qty
+          r.status = 'released'
+          r.reason = reason
+        }
+      })
+      return n
+    },
+    // 内部：方案版本留痕
+    _planAudit(text, extra = {}) {
+      this.planVersion += 1
+      this.planAudit.push({
+        v: this.planVersion, at: nowStr(), t: this._nowMs(),
+        who: this.currentDispatcherId, whoName: this.currentDispatcher.name,
+        text, ...extra
+      })
+      if (this.planAudit.length > MOVEMENT_CAP) this.planAudit.splice(0, this.planAudit.length - MOVEMENT_CAP)
+    },
+
     // 内部：扣库存 + 生成派发记录 + 联动事件状态/时间线（库存需已校验）
     _pushDispatch(baseId, eventId, type, qty, source = '手动') {
       const base = this.bases.find((b) => b.id === baseId)
       const ev = this.events.find((e) => e.id === eventId)
       if (!base || !ev || qty <= 0) return null
-      base.stock[type] = (base.stock[type] || 0) - qty
       const path = roughPath(base.lng, base.lat, ev.location.lng, ev.location.lat)
       const record = {
         id: 'dp-' + Date.now() + '-' + ++dpSeq,
@@ -218,17 +422,20 @@ export const useCommandStore = defineStore('command', {
         signedQty: 0, shortQty: 0, shortReplenished: 0, returnedQty: 0, withdrawnQty: 0,
         signLogs: [], returnLogs: [], withdrawLogs: [], replenishOf: null
       }
+      this._moveStock(baseId, type, -qty, source === '短缺补派' || source === '补给补派' ? 'replenish' : 'dispatch',
+        { eventId, dispatchId: record.id })
       this.dispatches.unshift(record)
       ev.timeline.push({ at: record.at, text: `${source}派发 ${record.typeLabel} ${qty}${record.unit}👈${base.name}` })
       if (ev.status === 'assessing' || ev.status === 'reported') ev.status = 'dispatching'
       notifyDispatchChanged()
       return record
     },
-    // 从资源库派发资源到受灾点
+    // 从资源库派发资源到受灾点（实物库存须扣除其它协同方案的生效预占）
     dispatchResource({ baseId, eventId, type, qty }) {
       const base = this.bases.find((b) => b.id === baseId)
       if (!base) return null
-      qty = Math.max(0, Math.min(qty, base.stock[type] || 0))
+      const cap = this.availableMap[baseId + '|' + type] ?? (base.stock[type] || 0)
+      qty = Math.max(0, Math.min(qty, cap))
       if (qty === 0) return null
       return this._pushDispatch(baseId, eventId, type, qty, '手动')
     },
@@ -236,9 +443,9 @@ export const useCommandStore = defineStore('command', {
     dispatchToShelter({ baseId, shelterId, shelterName, lng, lat, type, qty }) {
       const base = this.bases.find((b) => b.id === baseId)
       if (!base || qty <= 0) return null
-      qty = Math.min(qty, base.stock[type] || 0)
+      const cap = this.availableMap[baseId + '|' + type] ?? (base.stock[type] || 0)
+      qty = Math.min(qty, cap)
       if (qty === 0) return null
-      base.stock[type] = (base.stock[type] || 0) - qty
       const path = roughPath(base.lng, base.lat, lng, lat)
       const record = {
         id: 'dp-' + Date.now() + '-' + ++dpSeq,
@@ -252,6 +459,7 @@ export const useCommandStore = defineStore('command', {
         signedQty: 0, shortQty: 0, shortReplenished: 0, returnedQty: 0, withdrawnQty: 0,
         signLogs: [], returnLogs: [], withdrawLogs: [], replenishOf: null
       }
+      this._moveStock(baseId, type, -qty, 'supply', { dispatchId: record.id })
       this.dispatches.unshift(record)
       notifyDispatchChanged()
       return record
@@ -311,15 +519,14 @@ export const useCommandStore = defineStore('command', {
       if (need <= 0) return { ok: false, msg: '该派发无待补派的短缺量（短缺可能已补派）' }
       const source = rec.shelterId ? '补给补派' : '短缺补派'
       const sent = []
-      // 候选基地按运输时长升序，库存不足时跨基地拆单
+      // 候选基地按运输时长升序，库存不足时跨基地拆单（可用量须扣除生效预占）
       const cands = this.bases
-        .filter((b) => (b.stock[rec.type] || 0) > 0)
+        .filter((b) => (this.availableMap[b.id + '|' + rec.type] ?? 0) > 0)
         .map((b) => ({ b, path: roughPath(b.lng, b.lat, rec.lng, rec.lat) }))
         .sort((x, y) => x.path.minutes - y.path.minutes)
       for (const c of cands) {
         if (need <= 0) break
-        const take = Math.min(need, c.b.stock[rec.type])
-        c.b.stock[rec.type] -= take
+        const take = Math.min(need, this.availableMap[c.b.id + '|' + rec.type] ?? 0)
         need -= take
         const child = {
           id: 'dp-' + Date.now() + '-' + ++dpSeq,
@@ -334,6 +541,7 @@ export const useCommandStore = defineStore('command', {
           signedQty: 0, shortQty: 0, shortReplenished: 0, returnedQty: 0, withdrawnQty: 0,
           signLogs: [], returnLogs: [], withdrawLogs: [], replenishOf: rec.id
         }
+        this._moveStock(c.b.id, rec.type, -take, 'replenish', { eventId: rec.eventId || null, dispatchId: child.id })
         this.dispatches.unshift(child)
         sent.push(child)
       }
@@ -368,7 +576,7 @@ export const useCommandStore = defineStore('command', {
         return { ok: false, msg: `退回数量超出在途余量 ${parts.outstanding}${rec.unit}，不能重复回库` }
       }
       const base = this.bases.find((b) => b.id === rec.baseId)
-      if (base) base.stock[rec.type] = (base.stock[rec.type] || 0) + qty
+      this._moveStock(rec.baseId, rec.type, qty, 'return', { eventId: rec.eventId || null, dispatchId: rec.id })
       rec.returnedQty = parts.returned + qty
       if (!Array.isArray(rec.returnLogs)) rec.returnLogs = [] // 兼容旧记录
       rec.returnLogs.push({ at: nowStr(), qty, reason: (reason || '').trim() || '现场退回' })
@@ -406,10 +614,10 @@ export const useCommandStore = defineStore('command', {
       if (!rec || !nb || rec.status !== 'enroute' || rec.baseId === newBaseId) return null
       const moveQty = dispatchParts(rec).outstanding
       if (moveQty <= 0) return null
-      if ((nb.stock[rec.type] || 0) < moveQty) return null
+      if ((this.availableMap[newBaseId + '|' + rec.type] ?? 0) < moveQty) return null
       const ob = this.bases.find((b) => b.id === rec.baseId)
-      if (ob) ob.stock[rec.type] = (ob.stock[rec.type] || 0) + moveQty
-      nb.stock[rec.type] -= moveQty
+      this._moveStock(rec.baseId, rec.type, moveQty, 'reassignOut', { eventId: rec.eventId || null, dispatchId: rec.id })
+      this._moveStock(newBaseId, rec.type, -moveQty, 'reassignIn', { eventId: rec.eventId || null, dispatchId: rec.id })
       rec.baseId = nb.id
       rec.baseName = nb.name
       rec.via = []
@@ -428,8 +636,7 @@ export const useCommandStore = defineStore('command', {
       if (!rec || rec.status === 'held') return null
       const holdQty = dispatchParts(rec).outstanding
       if (holdQty <= 0) return null
-      const base = this.bases.find((b) => b.id === rec.baseId)
-      if (base) base.stock[rec.type] = (base.stock[rec.type] || 0) + holdQty
+      this._moveStock(rec.baseId, rec.type, holdQty, 'hold', { eventId: rec.eventId || null, dispatchId: rec.id })
       rec.status = 'held'
       rec.holdBy = blockId
       rec.via = []
@@ -445,10 +652,10 @@ export const useCommandStore = defineStore('command', {
       const qty = dispatchParts(rec).outstanding
       if (qty <= 0) return { ok: false, msg: '该派发已无待续派余量' }
       const base = this.bases.find((b) => b.id === rec.baseId)
-      if (!base || (base.stock[rec.type] || 0) < qty) {
-        return { ok: false, msg: `${base?.name || rec.baseName} 库存不足（需 ${qty}${rec.unit}），无法续派` }
+      if (!base || (this.availableMap[rec.baseId + '|' + rec.type] ?? 0) < qty) {
+        return { ok: false, msg: `${base?.name || rec.baseName} 可用库存不足（需 ${qty}${rec.unit}），无法续派` }
       }
-      base.stock[rec.type] -= qty
+      this._moveStock(rec.baseId, rec.type, -qty, 'resume', { eventId: rec.eventId || null, dispatchId: rec.id })
       rec.status = 'enroute'
       rec.holdBy = null
       rec.via = []
@@ -482,8 +689,7 @@ export const useCommandStore = defineStore('command', {
       const left = parts.outstanding
       // 仅在途余量回库：挂起时物资已随挂起退回基地，不重复返还
       if (left > 0 && rec.status === 'enroute') {
-        const base = this.bases.find((b) => b.id === rec.baseId)
-        if (base) base.stock[rec.type] = (base.stock[rec.type] || 0) + left
+        this._moveStock(rec.baseId, rec.type, left, 'withdraw', { eventId: rec.eventId || null, dispatchId: rec.id })
       }
       if (left > 0) {
         rec.withdrawnQty = parts.withdrawn + left
@@ -518,29 +724,75 @@ export const useCommandStore = defineStore('command', {
       notifyDispatchChanged()
     },
 
-    /* ---------- 多灾点资源统筹 ---------- */
+    /* ---------- 多灾点资源统筹 · 协同编制 ----------
+     * 多名调度员在同一会话内共同编制方案；每个方案项即时「预占」库存（不扣实物），
+     * 预占有 TTL，超时自动释放、方案项失效；提交时原子锁定（预占转实物扣减 + 冲突重算），
+     * 撤销整单时归还全部预占、已生成派发作撤回回库。方案版本与库存变动均入分支回放。 */
 
-    // 按 灾情等级 → 需求缺口 → 运输时长 生成跨基地分配方案（预占不扣库存，提交时才锁定）
-    generatePlan() {
+    // 切换当前调度员身份（演示多调度员协同）
+    switchDispatcher(id) {
+      if (DISPATCHERS.some((u) => u.id === id)) this.currentDispatcherId = id
+    },
+    // 开启协同方案会话（已有编辑中会话时直接复用）
+    beginPlanSession(name = '') {
+      if (this.planSession && this.planSession.status === 'editing') return this.planSession
+      const s = {
+        id: 'ps-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
+        name: (name || '').trim() || '多灾点统筹方案',
+        createdAt: this._nowMs(), at: nowStr(),
+        createdBy: this.currentDispatcherId, createdByName: this.currentDispatcher.name,
+        status: 'editing', submittedAt: null, revokedAt: null, dispatchIds: []
+      }
+      this.planSession = s
+      this.planResult = null
+      this._planAudit('协同方案建会：' + s.name, { kind: 'begin', sessionId: s.id })
+      return s
+    },
+    // 内部：建一个方案项并预占（owner 缺省为当前调度员）
+    _addPlanItem({ eventId, baseId, type, qty, owner = null, reserve = true }) {
+      const ev = this.events.find((e) => e.id === eventId)
+      const base = this.bases.find((b) => b.id === baseId)
+      if (!ev || !base || qty <= 0) return null
+      const path = roughPath(base.lng, base.lat, ev.location.lng, ev.location.lat)
+      const item = {
+        id: 'pi-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7),
+        eventId, baseId, type, qty: Math.round(qty),
+        distance: path.distance, minutes: path.minutes,
+        owner: owner || this.currentDispatcherId,
+        ownerName: DISPATCHERS.find((u) => u.id === (owner || this.currentDispatcherId))?.name || '',
+        createdAt: this._nowMs(), updatedAt: this._nowMs(),
+        // 旧方案兼容：无预占字段（reserved 缺省 0）的历史项按旧口径提交时即时校验
+        reserved: 0
+      }
+      this.plan.push(item)
+      if (reserve) {
+        const r = this._reserveItem(item, item.qty, item.owner)
+        item.reserved = r.qty
+        if (r.qty < item.qty) item.shortReserve = item.qty - r.qty
+      }
+      return item
+    },
+    // 按 灾情等级 → 需求缺口 → 运输时长 生成跨基地分配方案
+    // 协同语义：生成即开启会话并逐项预占库存（不扣实物），预占不足的缺口照列、待提交冲突重算
+    generatePlan(opts = {}) {
+      this.sweepExpiredReservations({ silent: true })
+      const session = this.beginPlanSession(opts.name || '')
+      const owner = opts.owner || this.currentDispatcherId
+      // 可用量 = 实物库存 − 生效预占（含他人已在本方案中的预占）
       const avail = {}
-      this.bases.forEach((b) => { avail[b.id] = { ...b.stock } })
-      // 按等级权重、缺口规模排序事件
-      const queue = this.events
-        .filter((e) => e.status !== 'closed')
-        .map((ev) => {
-          const gap = {}
-          let total = 0
-          Object.entries(ev.demand || {}).forEach(([t, need]) => {
-            const g = need - (this.sentMap[ev.id]?.[t] || 0)
-            if (g > 0) { gap[t] = g; total += g }
-          })
-          return { ev, gap, total }
-        })
+      this.bases.forEach((b) => {
+        avail[b.id] = {}
+        Object.keys(b.stock).forEach((t) => { avail[b.id][t] = this.availableMap[b.id + '|' + t] ?? 0 })
+      })
+      // 按等级权重、缺口规模排序事件（缺口已抵扣在途与本方案预占）
+      const queue = this.gaps
+        .map((g) => ({ ev: this.events.find((e) => e.id === g.eventId), gap: g.gap }))
+        .filter((x) => x.ev && x.ev.status !== 'closed')
+        .map((x) => ({ ev: x.ev, gap: x.gap, total: Object.values(x.gap).reduce((s, n) => s + n, 0) }))
         .filter((x) => x.total > 0)
         .sort((a, b) => (SEV_WEIGHT[b.ev.severity] - SEV_WEIGHT[a.ev.severity]) || (b.total - a.total))
 
-      const items = []
-      let seq = 0
+      let added = 0
       queue.forEach(({ ev, gap }) => {
         Object.entries(gap).forEach(([type, g]) => {
           let need = g
@@ -554,87 +806,291 @@ export const useCommandStore = defineStore('command', {
             const take = Math.min(need, avail[c.b.id][type])
             avail[c.b.id][type] -= take
             need -= take
-            items.push({
-              id: 'pi-' + ++seq,
-              eventId: ev.id, baseId: c.b.id, type, qty: take,
-              distance: c.path.distance, minutes: c.path.minutes
-            })
+            const item = this._addPlanItem({ eventId: ev.id, baseId: c.b.id, type, qty: take, owner })
+            if (item) added++
+          }
+          // 各基地可用量仍不足：缺口照列（无预占），提交时冲突重算/如实反馈
+          if (need > 0) {
+            const fb = this.bases
+              .map((b) => ({ b, path: roughPath(b.lng, b.lat, ev.location.lng, ev.location.lat) }))
+              .sort((x, y) => x.path.minutes - y.path.minutes)[0]?.b
+            if (fb) {
+              const item = this._addPlanItem({ eventId: ev.id, baseId: fb.id, type, qty: need, owner, reserve: false })
+              if (item) { item.shortReserve = need; added++ }
+            }
           }
         })
       })
-      this.plan = items
-      this.planResult = null
+      this._planAudit(`${this.currentDispatcher.name} 生成统筹方案：${added} 个方案项已预占库存`, { kind: 'generate', added })
+      return { session, added }
     },
-    // 人工调整：改数量 / 换基地（自动重算运输时长）
+    // 协同加项：当前调度员手动追加一个方案项并预占
+    addPlanItem({ eventId, baseId, type, qty }) {
+      if (!this.planSession || this.planSession.status !== 'editing') this.beginPlanSession()
+      const item = this._addPlanItem({ eventId, baseId, type, qty: Math.max(1, Math.round(qty || 0)) })
+      if (!item) return null
+      this._planAudit(`${this.currentDispatcher.name} 追加方案项：${RESOURCE_TYPES[item.type]?.label || item.type} ${item.qty}`, { kind: 'add', itemId: item.id })
+      return item
+    },
+    // 人工调整：改数量（同步增减预占）/ 换基地（释放旧预占、在新基地重新预占、重算时长）
     updatePlanItem(id, patch) {
       const it = this.plan.find((p) => p.id === id)
       if (!it) return
-      if (patch.qty != null) it.qty = Math.max(1, Math.round(patch.qty))
+      let changed = false
+      if (patch.qty != null) {
+        const q = Math.max(1, Math.round(patch.qty))
+        if (q !== it.qty) {
+          if (q > it.qty) {
+            // 增量预占：可用量不足则只预占到上限，差额留待提交冲突重算（r.qty 为累计预占）
+            const r = this._reserveItem(it, q - it.qty, it.owner)
+            it.reserved = r.qty
+          } else {
+            // 减量：从其生效预占中核减（释放差额）
+            this._trimReservation(it, Math.min(it.reserved || 0, q))
+            it.reserved = Math.min(it.reserved || 0, q)
+          }
+          it.qty = q
+          it.shortReserve = Math.max(0, it.qty - (it.reserved || 0))
+          it.updatedAt = this._nowMs()
+          changed = true
+        }
+      }
       if (patch.baseId && patch.baseId !== it.baseId) {
         const base = this.bases.find((b) => b.id === patch.baseId)
         const ev = this.events.find((e) => e.id === it.eventId)
         if (base && ev) {
+          this._releaseItemReservation(it.id, '换基地')
           it.baseId = patch.baseId
           const path = roughPath(base.lng, base.lat, ev.location.lng, ev.location.lat)
           it.distance = path.distance
           it.minutes = path.minutes
+          const r = this._reserveItem(it, it.qty, it.owner)
+          it.reserved = r.qty
+          it.shortReserve = Math.max(0, it.qty - r.qty)
+          it.updatedAt = this._nowMs()
+          changed = true
         }
       }
+      if (changed) this._planAudit(`${this.currentDispatcher.name} 调整方案项（数量/基地）`, { kind: 'update', itemId: id })
     },
+    // 内部：把方案项生效预占核减到 targetQty（不低于 0；归零即释放）
+    _trimReservation(item, targetQty) {
+      const r = this.reservations.find((x) => x.itemId === item.id && x.status === 'active')
+      if (!r) return
+      r.qty = Math.max(0, Math.round(targetQty))
+      if (r.qty === 0) { r.status = 'released'; r.reason = '方案核减' }
+    },
+    // 删除方案项（归还该项预占）
     removePlanItem(id) {
+      const it = this.plan.find((p) => p.id === id)
+      if (!it) return
+      this._releaseItemReservation(id, '删除方案项')
       this.plan = this.plan.filter((p) => p.id !== id)
+      this._planAudit(`${this.currentDispatcher.name} 删除方案项`, { kind: 'remove', itemId: id })
     },
+    // 超时清理：把已超时的生效预占落账释放，对应方案项标记失效（保留在方案中，可重新预占/删除）
+    sweepExpiredReservations(opts = {}) {
+      const now = this._nowMs()
+      if (this.reservationTtl == null) return []
+      const expired = this.reservations.filter((r) => r.status === 'active' && now - r.createdAt >= this.reservationTtl)
+      const released = []
+      expired.forEach((r) => {
+        r.status = 'expired'
+        r.releasedAt = now
+        released.push(r)
+        const it = this.plan.find((p) => p.id === r.itemId)
+        if (it) {
+          it.reserved = 0
+          it.expired = true
+          it.expiredAt = now
+        }
+      })
+      if (released.length && !opts.silent) {
+        const who = DISPATCHERS.find((u) => u.id === released[0].owner)?.name || '调度员'
+        this._planAudit(`⏰ 预占超时自动释放：${released.length} 笔预占（${who}等编制的方案项需重新预占）`,
+          { kind: 'expire', count: released.length })
+      }
+      return released
+    },
+    // 重新预占失效/旧方案项（调度员续期；提交前统一复核亦可）
+    reReserveItem(id) {
+      const it = this.plan.find((p) => p.id === id)
+      if (!it) return { ok: false, msg: '方案项不存在' }
+      // 旧的失效/生效预占先落账为 released，再按当前可用量新建生效预占
+      this.reservations.forEach((r) => {
+        if (r.itemId === id && (r.status === 'active' || r.status === 'expired')) { r.status = 'released'; r.reason = '重新预占' }
+      })
+      const r = this._reserveItem(it, it.qty, it.owner)
+      it.reserved = r.qty
+      it.shortReserve = Math.max(0, it.qty - r.qty)
+      it.expired = false
+      it.expiredAt = null
+      it.updatedAt = this._nowMs()
+      this._planAudit(`${this.currentDispatcher.name} 重新预占方案项：${r.qty}${RESOURCE_TYPES[it.type]?.unit || ''}`,
+        { kind: 'rereserve', itemId: id, qty: r.qty })
+      return { ok: true, reserved: r.qty, short: it.shortReserve }
+    },
+    // 清空方案（归还全部生效/超时预占；会话保留为编辑态以便重新编制）
     clearPlan() {
+      this.plan.forEach((p) => this._releaseItemReservation(p.id, '清空方案'))
       this.plan = []
+      this._planAudit(`${this.currentDispatcher.name} 清空统筹方案，全部预占归还`, { kind: 'clear' })
     },
-    // 提交：统一校验 → 锁定库存 → 冲突重分配 → 批量派发（联动事件/路线/统计）
+    // 内部：提交前归一化——旧方案项（无预占字段）按当前可用量即时补预占
+    _ensureReservations() {
+      this.plan.forEach((it) => {
+        if (it.reserved == null) it.reserved = 0 // 旧记录兼容
+        if (it.owner == null) { it.owner = this.currentDispatcherId; it.ownerName = this.currentDispatcher.name }
+        if (it.reserved <= 0 && !it.expired) {
+          const r = this._reserveItem(it, it.qty, it.owner)
+          it.reserved = r.qty
+          it.shortReserve = Math.max(0, it.qty - r.qty)
+        }
+      })
+    },
+    // 提交：先清理超时 → 统一校验 → 预占锁定 + 冲突重分配 → 原子批量生成派发
+    // 任一项的计算在提交快照内完成，全部 takes 落库后才生效；仍不足的缺口如实反馈
     submitPlan() {
       if (!this.plan.length) return null
-      const remaining = {}
-      this.bases.forEach((b) => { remaining[b.id] = { ...b.stock } })
+      if (this.planSession && this.planSession.status !== 'editing') return null
+      // 1) 超时预占落账释放（失效项不参与，须重新预占后再提交）
+      this.sweepExpiredReservations()
+      const dead = this.plan.filter((p) => p.expired)
+      if (dead.length) {
+        return { ok: false, msg: `${dead.length} 个方案项预占已超时失效，请重新预占后再提交`, expiredItems: dead.map((p) => p.id) }
+      }
+      // 2) 旧方案项兼容补预占
+      this._ensureReservations()
+
+      // 3) 提交快照：实物库存与全部生效预占（计算阶段不改状态，保证原子性）
       const evOf = (id) => this.events.find((e) => e.id === id)
-      // 高等级事件、短运输时长优先锁定库存
       const items = [...this.plan].sort((a, b) => {
         const wa = SEV_WEIGHT[evOf(a.eventId)?.severity] || 0
         const wb = SEV_WEIGHT[evOf(b.eventId)?.severity] || 0
         return wb - wa || a.minutes - b.minutes
       })
+      // 各 基地+类型：预占池 / 自由库存池（实物 − 生效预占）。两池互不重叠，分别核减避免重复占用。
+      const reservedPool = {}
+      this.reservations.filter((r) => r.status === 'active').forEach((r) => {
+        const k = r.baseId + '|' + r.type
+        reservedPool[k] = (reservedPool[k] || 0) + r.qty
+      })
+      const free = {}
+      this.bases.forEach((b) => {
+        Object.keys(b.stock).forEach((t) => {
+          const k = b.id + '|' + t
+          // 期间实物可能被其它动作挪用：预占池超出实物时截断，自由池不出现负值
+          reservedPool[k] = Math.min(reservedPool[k] || 0, b.stock[t] || 0)
+          free[k] = Math.max(0, (b.stock[t] || 0) - (reservedPool[k] || 0))
+        })
+      })
       const takes = []
-      const result = { total: items.length, ok: 0, realloc: 0, unmet: [], at: nowStr() }
+      const result = { ok: true, total: items.length, direct: 0, realloc: 0, unmet: [], at: nowStr(), dispatchIds: [] }
+      // 从自由库存池出库（本基地兜底 / 跨基地冲突重算）
+      const consumeFree = (baseId, type, qty, eventId) => {
+        if (qty <= 0) return
+        takes.push({ baseId, eventId, type, qty })
+        const k = baseId + '|' + type
+        free[k] = Math.max(0, (free[k] ?? 0) - qty)
+      }
       items.forEach((it) => {
         const ev = evOf(it.eventId)
+        const k = it.baseId + '|' + it.type
         let need = it.qty
-        const parts = []
-        const own = Math.min(need, remaining[it.baseId]?.[it.type] || 0)
-        if (own > 0) { parts.push({ baseId: it.baseId, qty: own }); need -= own }
+        let moved = false
+        // 3.1 预占保障：该项已预占部分从「预占池」锁定（不动自由池）
+        const own = Math.min(need, it.reserved || 0, reservedPool[k] || 0)
+        if (own > 0) {
+          takes.push({ baseId: it.baseId, eventId: it.eventId, type: it.type, qty: own })
+          reservedPool[k] -= own
+          need -= own
+        }
+        // 3.2 预占不足：本基地自由库存兜底
+        if (need > 0) {
+          const ownFree = Math.min(need, free[k] ?? 0)
+          if (ownFree > 0) { consumeFree(it.baseId, it.type, ownFree, it.eventId); need -= ownFree; moved = true }
+        }
+        // 3.3 冲突重算：本基地仍不足，按运输时长从其他基地的自由库存重分配
         if (need > 0 && ev) {
-          // 冲突：原基地库存不足，按运输时长从其他基地重新分配
           const alts = this.bases
-            .filter((b) => b.id !== it.baseId && (remaining[b.id][it.type] || 0) > 0)
-            .map((b) => ({ b, path: roughPath(b.lng, b.lat, ev.location.lng, ev.location.lat) }))
+            .filter((b) => b.id !== it.baseId)
+            .map((b) => ({ b, path: roughPath(b.lng, b.lat, ev.location.lng, ev.location.lat), f: free[b.id + '|' + it.type] ?? 0 }))
+            .filter((x) => x.f > 0)
             .sort((x, y) => x.path.minutes - y.path.minutes)
           for (const a of alts) {
             if (need <= 0) break
-            const t = Math.min(need, remaining[a.b.id][it.type])
-            parts.push({ baseId: a.b.id, qty: t })
+            const t = Math.min(need, a.f)
+            consumeFree(a.b.id, it.type, t, it.eventId)
             need -= t
+            moved = true
           }
         }
-        if (parts.some((p) => p.baseId !== it.baseId) || parts.length > 1) result.realloc++
-        else if (parts.length) result.ok++
-        if (need > 0) {
-          result.unmet.push({ eventTitle: ev?.title || it.eventId, type: it.type, qty: need })
-        }
-        parts.forEach((p) => {
-          remaining[p.baseId][it.type] -= p.qty // 锁定库存
-          takes.push({ baseId: p.baseId, eventId: it.eventId, type: it.type, qty: p.qty })
-        })
+        if (moved || (it.reserved || 0) < it.qty) result.realloc++
+        else result.direct++
+        if (need > 0) result.unmet.push({ eventTitle: ev?.title || it.eventId, type: it.type, qty: need })
       })
-      // 批量执行：扣库存 + 生成派发记录 + 联动事件状态/时间线（路线与统计由响应式自动更新）
-      takes.forEach((t) => this._pushDispatch(t.baseId, t.eventId, t.type, t.qty, '统筹'))
+
+      // 4) 原子提交：仅核销本方案项的预占（其它会话/游离预占不受影响）→ 一次性扣库存并生成派发
+      const planItemIds = new Set(items.map((it) => it.id))
+      this.reservations.filter((r) => r.status === 'active' && planItemIds.has(r.itemId)).forEach((r) => {
+        r.status = 'committed'
+        r.committedAt = this._nowMs()
+      })
+      takes.forEach((t) => {
+        const rec = this._pushDispatch(t.baseId, t.eventId, t.type, t.qty, '统筹协同')
+        if (rec) result.dispatchIds.push(rec.id)
+      })
+
+      const session = this.planSession
+      if (session) {
+        session.status = 'submitted'
+        session.submittedAt = this._nowMs()
+        session.dispatchIds = result.dispatchIds
+      }
       this.plan = []
-      this.planResult = result
-      return result
+      this.planResult = {
+        total: result.total, ok: result.direct, realloc: result.realloc,
+        unmet: result.unmet, at: result.at, dispatchIds: result.dispatchIds
+      }
+      this._planAudit(`✅ 协同方案原子提交：${takes.length} 批派发已生成（直接 ${result.direct} · 冲突重算 ${result.realloc}）`
+        + (result.unmet.length ? `，${result.unmet.length} 项缺口未满足` : ''),
+        { kind: 'submit', takes: takes.length, unmet: result.unmet.length })
+      // 提交后通知道路阻断模块即时复核新派发
+      notifyDispatchChanged()
+      return this.planResult
+    },
+    // 撤销协同方案：已生成的整批派发作撤回（在途余量回库，签收/短缺账目留档），会话标记已撤销
+    // 若方案尚在编辑态，则仅归还全部预占、作废方案
+    undoPlan(reason = '调度员撤销方案') {
+      const session = this.planSession
+      // 编辑态撤销：归还预占
+      if (session && session.status === 'editing') {
+        const n = this.plan.length
+        this.plan.forEach((p) => this._releaseItemReservation(p.id, '撤销方案'))
+        this.plan = []
+        session.status = 'revoked'
+        session.revokedAt = this._nowMs()
+        session.revokeReason = reason
+        this._planAudit(`🚫 撤销协同方案（编制中）：${n} 个方案项预占全部归还`, { kind: 'undo', mode: 'editing' })
+        return { ok: true, mode: 'editing', released: n }
+      }
+      // 已提交撤销：整批派发作撤回回库
+      if (session && session.status === 'submitted') {
+        let back = 0
+        const ids = session.dispatchIds || []
+        ids.forEach((id) => {
+          const rec = this.dispatches.find((d) => d.id === id)
+          if (rec) back += this._withdrawRecord(rec, '协同方案撤销：' + reason)
+        })
+        session.status = 'revoked'
+        session.revokedAt = this._nowMs()
+        session.revokeReason = reason
+        this._planAudit(`🚫 撤销协同方案（已提交）：${ids.length} 批派发作撤回，在途余量 ${back} 已回库`,
+          { kind: 'undo', mode: 'submitted', dispatches: ids.length, back })
+        notifyDispatchChanged()
+        return { ok: true, mode: 'submitted', dispatches: ids.length, back }
+      }
+      return { ok: false, msg: '没有可撤销的协同方案' }
     },
 
     // 大屏数据自动刷新（模拟实时数据变化演示）
@@ -658,10 +1114,15 @@ export const useCommandStore = defineStore('command', {
       if (!ev) return
       // 撤回该事件关联的所有派发：在途/挂起余量回库，签收/短缺/补派/退回账目留档
       const rows = this.dispatches.filter((d) => d.eventId === eventId)
-      if (!rows.length) return
+      // 该事件在协同方案中尚未提交的方案项一并移除、预占归还
+      const pending = this.plan.filter((p) => p.eventId === eventId)
+      if (!rows.length && !pending.length) return
+      pending.forEach((p) => this._releaseItemReservation(p.id, '重置事件资源'))
+      if (pending.length) this.plan = this.plan.filter((p) => p.eventId !== eventId)
       let back = 0
       rows.forEach((d) => { back += this._withdrawRecord(d, '重置事件资源') })
-      ev.timeline.push({ at: nowStr(), text: `🚫 重置资源：${rows.length} 条派发撤回，在途余量 ${back} 已回库，历史签收/退回记录保留` })
+      ev.timeline.push({ at: nowStr(), text: `🚫 重置资源：${rows.length} 条派发撤回，在途余量 ${back} 已回库，历史签收/退回记录保留`
+        + (pending.length ? `；${pending.length} 个未提交方案项移除、预占归还` : '') })
       notifyDispatchChanged()
     }
   }
